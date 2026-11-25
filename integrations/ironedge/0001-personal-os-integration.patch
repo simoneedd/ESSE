@@ -1,0 +1,824 @@
+From 1c10df6ccc2ddc18b04605a9816fd27155e4509c Mon Sep 17 00:00:00 2001
+From: Personal OS integration <noreply@anthropic.com>
+Date: Wed, 25 Nov 2026 22:39:46 +0000
+Subject: [PATCH] feat: interfaccia di integrazione Personal OS (API firmata
+ HMAC, migrazione additiva)
+
+- migrazione additiva: priority, estimated_minutes, category, depends_on (opzionali) sulle task
+- integration_nonces + funzioni solo service role limitate a un workspace
+- /api/integrations/personal-os: GET elenco incrementale, POST cambio stato open/done
+- IronEdge resta autorevole: conflitti rilevati con versione, nessuna scrittura
+- rollback supabase/rollback/20261126000001_down.sql, test DB e unit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SETgpiT5SrZGcDegL6YCTU
+---
+ .env.example                                  |   5 +
+ src/app/api/integrations/personal-os/route.ts |  26 +++
+ src/lib/env.ts                                |   4 +
+ src/lib/personal-os-protocol.ts               | 141 +++++++++++++++
+ src/lib/personal-os.ts                        | 165 ++++++++++++++++++
+ src/proxy.ts                                  |   2 +-
+ ...20261126000001_personal_os_integration.sql | 106 +++++++++++
+ supabase/rollback/20261126000001_down.sql     |  14 ++
+ tests/db/backup-restore.test.ts               |   4 +-
+ tests/db/personal-os.test.ts                  |  92 ++++++++++
+ tests/db/rollback.test.ts                     |   3 +-
+ tests/unit/personal-os.test.ts                | 120 +++++++++++++
+ 12 files changed, 678 insertions(+), 4 deletions(-)
+ create mode 100644 src/app/api/integrations/personal-os/route.ts
+ create mode 100644 src/lib/personal-os-protocol.ts
+ create mode 100644 src/lib/personal-os.ts
+ create mode 100644 supabase/migrations/20261126000001_personal_os_integration.sql
+ create mode 100644 supabase/rollback/20261126000001_down.sql
+ create mode 100644 tests/db/personal-os.test.ts
+ create mode 100644 tests/unit/personal-os.test.ts
+
+diff --git a/.env.example b/.env.example
+index 542d879..4a92a78 100644
+--- a/.env.example
++++ b/.env.example
+@@ -29,3 +29,8 @@ AI_MAX_REQUESTS_PER_DAY=20
+ METRICOOL_API_TOKEN=
+ METRICOOL_USER_ID=
+ METRICOOL_BLOG_ID=
++
++# --- Integrazione Personal OS (opzionale, server-to-server firmata HMAC) ---
++PERSONAL_OS_SHARED_SECRET=        # >= 32 caratteri casuali; stesso valore di IRONEDGE_SHARED_SECRET in Personal OS
++PERSONAL_OS_WORKSPACE_ID=         # UUID dell'UNICO workspace esposto a Personal OS
++PERSONAL_OS_ACTOR_USER_ID=        # UUID del tuo utente IronEdge (owner/editor): firma i completamenti
+diff --git a/src/app/api/integrations/personal-os/route.ts b/src/app/api/integrations/personal-os/route.ts
+new file mode 100644
+index 0000000..068afb4
+--- /dev/null
++++ b/src/app/api/integrations/personal-os/route.ts
+@@ -0,0 +1,26 @@
++import { NextResponse } from "next/server";
++import { serverEnv } from "@/lib/env";
++import { handlePersonalOs } from "@/lib/personal-os";
++import { MAX_BODY_BYTES } from "@/lib/personal-os-protocol";
++import { supabaseAdmin } from "@/lib/supabase/server";
++
++export const dynamic = "force-dynamic";
++export const maxDuration = 30;
++
++/**
++ * Integrazione server-to-server con Personal OS (richieste firmate HMAC, nonce monouso).
++ * GET  ?since=&from=&to=&limit=  -> occorrenze task del workspace configurato
++ * POST {external_id, status, base_version} -> cambio stato open/done (IronEdge autorevole)
++ */
++async function handle(req: Request) {
++  const len = Number(req.headers.get("content-length") ?? 0);
++  if (len > MAX_BODY_BYTES) return NextResponse.json({ error: "Corpo troppo grande" }, { status: 413 });
++  const body = req.method === "GET" ? "" : (await req.text()).slice(0, MAX_BODY_BYTES + 1);
++  const env = serverEnv();
++  if (!env.PERSONAL_OS_SHARED_SECRET) return NextResponse.json({ error: "Integrazione non configurata" }, { status: 503 });
++  const r = await handlePersonalOs(supabaseAdmin(), env, { method: req.method, url: req.url, headers: req.headers, body });
++  return NextResponse.json(r.body, { status: r.status, headers: { "Cache-Control": "no-store" } });
++}
++
++export const GET = handle;
++export const POST = handle;
+diff --git a/src/lib/env.ts b/src/lib/env.ts
+index 30901d0..c95dbcf 100644
+--- a/src/lib/env.ts
++++ b/src/lib/env.ts
+@@ -27,6 +27,10 @@ const serverSchema = z.object({
+   METRICOOL_API_TOKEN: z.string().optional(),
+   METRICOOL_USER_ID: z.string().optional(),
+   METRICOOL_BLOG_ID: z.string().optional(),
++  // Integrazione Personal OS (server-to-server, firmata HMAC). Disattivata se mancano.
++  PERSONAL_OS_SHARED_SECRET: z.string().min(32).optional(),
++  PERSONAL_OS_WORKSPACE_ID: z.uuid().optional(),
++  PERSONAL_OS_ACTOR_USER_ID: z.uuid().optional(),
+ });
+ 
+ export type PublicEnv = z.infer<typeof publicSchema>;
+diff --git a/src/lib/personal-os-protocol.ts b/src/lib/personal-os-protocol.ts
+new file mode 100644
+index 0000000..6dd5ed0
+--- /dev/null
++++ b/src/lib/personal-os-protocol.ts
+@@ -0,0 +1,141 @@
++import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
++import { z } from "zod";
++
++/**
++ * Protocollo server-to-server Personal OS <-> IronEdge Growth OS (v1).
++ *
++ * File IDENTICO nei due repository (IronEdge: src/lib/personal-os-protocol.ts).
++ *
++ * Sicurezza:
++ *  - firma HMAC-SHA256 con segreto condiviso (>= 32 caratteri) conservato SOLO lato server
++ *    (env PERSONAL_OS_SHARED_SECRET in IronEdge, IRONEDGE_SHARED_SECRET in Personal OS);
++ *  - la firma copre metodo, path, timestamp, nonce e hash del corpo: nessuna manomissione;
++ *  - finestra temporale +-300 s e nonce monouso (replay protection lato IronEdge);
++ *  - permessi minimi: l'API espone solo lettura delle task di UN workspace e il cambio di stato
++ *    di un'occorrenza (open/done). Nessun'altra tabella e' raggiungibile.
++ *  - minimizzazione: Personal OS invia SOLO {external_id, status, base_version}; i dati personali,
++ *    alimentari e sanitari non hanno alcun campo nel contratto e vengono rifiutati (schema strict).
++ */
++
++export const PROTOCOL_VERSION = "pos-v1";
++export const MAX_SKEW_SECONDS = 300;
++export const MAX_BODY_BYTES = 16_384;
++
++export const HEADER = {
++  version: "x-pos-version",
++  timestamp: "x-pos-timestamp",
++  nonce: "x-pos-nonce",
++  signature: "x-pos-signature",
++  idempotency: "idempotency-key",
++} as const;
++
++export function sha256Hex(input: string): string {
++  return createHash("sha256").update(input, "utf8").digest("hex");
++}
++
++export function canonicalString(method: string, path: string, timestamp: string, nonce: string, body: string): string {
++  return [PROTOCOL_VERSION, method.toUpperCase(), path, timestamp, nonce, sha256Hex(body)].join("\n");
++}
++
++export function sign(secret: string, method: string, path: string, timestamp: string, nonce: string, body: string): string {
++  return createHmac("sha256", secret).update(canonicalString(method, path, timestamp, nonce, body)).digest("hex");
++}
++
++export function newNonce(): string {
++  return randomBytes(16).toString("hex");
++}
++
++/** Header firmati per una richiesta in uscita. `path` include la query string. */
++export function signedHeaders(secret: string, method: string, path: string, body = "", now = Date.now(), nonce = newNonce()): Record<string, string> {
++  if (!secret || secret.length < 32) throw new Error("Segreto di integrazione assente o troppo corto");
++  const ts = String(Math.floor(now / 1000));
++  return {
++    [HEADER.version]: PROTOCOL_VERSION,
++    [HEADER.timestamp]: ts,
++    [HEADER.nonce]: nonce,
++    [HEADER.signature]: sign(secret, method, path, ts, nonce, body),
++  };
++}
++
++export type VerifyResult = { ok: true; nonce: string; timestamp: number } | { ok: false; status: 400 | 401; reason: string };
++
++/** Verifica a tempo costante. Il controllo del nonce (replay) va fatto poi su database. */
++export function verifySignedRequest(
++  secret: string | undefined,
++  req: { method: string; path: string; headers: Headers; body: string },
++  now = Date.now(),
++): VerifyResult {
++  if (!secret || secret.length < 32) return { ok: false, status: 401, reason: "integrazione non configurata" };
++  if (req.headers.get(HEADER.version) !== PROTOCOL_VERSION) return { ok: false, status: 400, reason: "versione protocollo" };
++  const ts = req.headers.get(HEADER.timestamp) ?? "";
++  const nonce = req.headers.get(HEADER.nonce) ?? "";
++  const sig = req.headers.get(HEADER.signature) ?? "";
++  if (!/^\d{9,11}$/.test(ts) || !/^[a-f0-9]{32}$/.test(nonce) || !/^[a-f0-9]{64}$/.test(sig)) {
++    return { ok: false, status: 401, reason: "header firma non validi" };
++  }
++  const t = Number(ts);
++  if (Math.abs(now / 1000 - t) > MAX_SKEW_SECONDS) return { ok: false, status: 401, reason: "timestamp fuori finestra" };
++  if (Buffer.byteLength(req.body, "utf8") > MAX_BODY_BYTES) return { ok: false, status: 400, reason: "corpo troppo grande" };
++  const expected = Buffer.from(sign(secret, req.method, req.path, ts, nonce, req.body), "hex");
++  const given = Buffer.from(sig, "hex");
++  if (expected.length !== given.length || !timingSafeEqual(expected, given)) return { ok: false, status: 401, reason: "firma non valida" };
++  return { ok: true, nonce, timestamp: t };
++}
++
++// ---------------------------------------------------------------------------
++// Contratto dati
++// ---------------------------------------------------------------------------
++const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
++
++/** Una occorrenza di task IronEdge come esposta a Personal OS. */
++export const remoteTaskSchema = z.object({
++  occurrence_id: z.uuid(),
++  task_id: z.uuid(),
++  title: z.string().min(1).max(200),
++  description: z.string().max(8000).nullable(),
++  priority: z.number().int().min(1).max(4).nullable(),
++  due_date: isoDate.nullable(),
++  occurrence_date: isoDate,
++  estimated_minutes: z.number().int().min(5).max(1440).nullable(),
++  status: z.enum(["open", "done", "skipped"]),
++  category: z.string().max(80).nullable(),
++  depends_on: z.array(z.uuid()).max(50),
++  completed_at: z.string().nullable(),
++  version: z.string().min(1).max(64), // updated_at dell'occorrenza (ISO)
++  task_active: z.boolean(),
++  url: z.string().max(500),
++});
++export type RemoteTask = z.infer<typeof remoteTaskSchema>;
++
++export const listResponseSchema = z.object({
++  protocol: z.literal(PROTOCOL_VERSION),
++  items: z.array(remoteTaskSchema).max(500),
++  next_cursor: z.string().max(64).nullable(),
++  has_more: z.boolean(),
++  server_time: z.string(),
++});
++export type ListResponse = z.infer<typeof listResponseSchema>;
++
++/** Unica scrittura consentita: cambio di stato. strict(): qualsiasi campo extra viene rifiutato. */
++export const statusUpdateSchema = z
++  .object({
++    external_id: z.string().regex(/^occ:[0-9a-f-]{36}$/),
++    status: z.enum(["open", "done"]),
++    base_version: z.string().max(64).nullable(),
++  })
++  .strict();
++export type StatusUpdate = z.infer<typeof statusUpdateSchema>;
++
++export const statusResponseSchema = z.object({
++  protocol: z.literal(PROTOCOL_VERSION),
++  result: z.enum(["applied", "noop", "conflict", "not_found"]),
++  status: z.enum(["open", "done", "skipped"]).nullable(),
++  version: z.string().nullable(),
++  completed_at: z.string().nullable(),
++});
++export type StatusResponse = z.infer<typeof statusResponseSchema>;
++
++export const occurrenceIdFromExternal = (externalId: string): string | null => {
++  const m = /^occ:([0-9a-f-]{36})$/.exec(externalId);
++  return m ? m[1] : null;
++};
+diff --git a/src/lib/personal-os.ts b/src/lib/personal-os.ts
+new file mode 100644
+index 0000000..e9dcbe4
+--- /dev/null
++++ b/src/lib/personal-os.ts
+@@ -0,0 +1,165 @@
++import type { SupabaseClient } from "@supabase/supabase-js";
++import { z } from "zod";
++import type { ServerEnv } from "./env";
++import {
++  HEADER,
++  PROTOCOL_VERSION,
++  occurrenceIdFromExternal,
++  statusUpdateSchema,
++  verifySignedRequest,
++  type ListResponse,
++  type RemoteTask,
++  type StatusResponse,
++} from "./personal-os-protocol";
++import { log, rateLimit, redact } from "./security";
++
++/**
++ * API di integrazione per Personal OS (vedi personal-os-protocol.ts).
++ * Permessi minimi: un solo workspace (PERSONAL_OS_WORKSPACE_ID), lettura task/occorrenze,
++ * cambio di stato open/done firmato dall'utente PERSONAL_OS_ACTOR_USER_ID (owner/editor).
++ * IronEdge resta la fonte autorevole: in caso di conflitto non scrive e restituisce il proprio stato.
++ */
++export type Json = { status: number; body: unknown };
++
++export function personalOsConfig(env: ServerEnv) {
++  if (!env.PERSONAL_OS_SHARED_SECRET || !env.PERSONAL_OS_WORKSPACE_ID || !env.PERSONAL_OS_ACTOR_USER_ID) return null;
++  return { secret: env.PERSONAL_OS_SHARED_SECRET, workspaceId: env.PERSONAL_OS_WORKSPACE_ID, actorId: env.PERSONAL_OS_ACTOR_USER_ID };
++}
++
++const listQuery = z.object({
++  since: z.iso.datetime({ offset: true }).nullable(),
++  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
++  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
++  limit: z.coerce.number().int().min(1).max(500).default(200),
++});
++
++type Row = {
++  occurrence_id: string;
++  task_id: string;
++  title: string;
++  description: string | null;
++  priority: number | null;
++  due_date: string | null;
++  occurrence_date: string;
++  estimated_minutes: number | null;
++  status: "open" | "done" | "skipped";
++  category: string | null;
++  depends_on: string[] | null;
++  completed_at: string | null;
++  version: string;
++  task_active: boolean;
++};
++
++const iso = (v: string | null) => (v ? new Date(v).toISOString() : null);
++
++async function authenticate(
++  admin: SupabaseClient,
++  cfg: NonNullable<ReturnType<typeof personalOsConfig>>,
++  req: { method: string; path: string; headers: Headers; body: string },
++  now: number,
++): Promise<Json | null> {
++  const v = verifySignedRequest(cfg.secret, req, now);
++  if (!v.ok) {
++    log.warn("personal-os: richiesta rifiutata", v.reason);
++    return { status: v.status, body: { error: "Non autorizzato" } };
++  }
++  const { data: fresh, error } = await admin.rpc("integration_use_nonce", { p_nonce: v.nonce });
++  if (error) throw new Error(`nonce: ${error.message}`);
++  if (!fresh) return { status: 401, body: { error: "Richiesta gia' ricevuta (replay)" } };
++  return null;
++}
++
++export async function handlePersonalOs(
++  admin: SupabaseClient,
++  env: ServerEnv,
++  req: { method: string; url: string; headers: Headers; body: string },
++  now = Date.now(),
++): Promise<Json> {
++  const cfg = personalOsConfig(env);
++  if (!cfg) return { status: 503, body: { error: "Integrazione Personal OS non configurata" } };
++  if (!rateLimit("personal-os", 120, 60_000, now)) return { status: 429, body: { error: "Troppe richieste" } };
++  const url = new URL(req.url);
++  const path = url.pathname + url.search;
++  try {
++    const denied = await authenticate(admin, cfg, { method: req.method, path, headers: req.headers, body: req.body }, now);
++    if (denied) return denied;
++
++    if (req.method === "GET") {
++      const q = listQuery.safeParse({
++        since: url.searchParams.get("since"),
++        from: url.searchParams.get("from"),
++        to: url.searchParams.get("to"),
++        limit: url.searchParams.get("limit") ?? undefined,
++      });
++      if (!q.success) return { status: 400, body: { error: "Parametri non validi" } };
++      const spanDays = (Date.parse(q.data.to) - Date.parse(q.data.from)) / 86_400_000;
++      if (spanDays < 0 || spanDays > 62) return { status: 400, body: { error: "Intervallo date non valido (max 62 giorni)" } };
++      const { data, error } = await admin.rpc("integration_list_tasks", {
++        p_ws: cfg.workspaceId,
++        p_since: q.data.since,
++        p_from: q.data.from,
++        p_to: q.data.to,
++        p_limit: q.data.limit + 1,
++      });
++      if (error) throw new Error(error.message);
++      const rows = (data ?? []) as Row[];
++      const page = rows.slice(0, q.data.limit);
++      const items: RemoteTask[] = page.map((r) => ({
++        occurrence_id: r.occurrence_id,
++        task_id: r.task_id,
++        title: r.title,
++        description: r.description,
++        priority: r.priority,
++        due_date: r.due_date,
++        occurrence_date: r.occurrence_date,
++        estimated_minutes: r.estimated_minutes,
++        status: r.status,
++        category: r.category,
++        depends_on: r.depends_on ?? [],
++        completed_at: iso(r.completed_at),
++        version: iso(r.version)!,
++        task_active: r.task_active,
++        url: `${url.origin}/impostazioni#task-${r.task_id}`,
++      }));
++      const body: ListResponse = {
++        protocol: PROTOCOL_VERSION,
++        items,
++        next_cursor: items.length ? items[items.length - 1].version : q.data.since,
++        has_more: rows.length > q.data.limit,
++        server_time: new Date(now).toISOString(),
++      };
++      return { status: 200, body };
++    }
++
++    if (req.method === "POST") {
++      let raw: unknown;
++      try {
++        raw = JSON.parse(req.body);
++      } catch {
++        return { status: 400, body: { error: "JSON non valido" } };
++      }
++      const parsed = statusUpdateSchema.safeParse(raw);
++      if (!parsed.success) return { status: 400, body: { error: "Payload non valido: sono ammessi solo external_id, status, base_version" } };
++      const occ = occurrenceIdFromExternal(parsed.data.external_id);
++      if (!occ) return { status: 400, body: { error: "external_id non valido" } };
++      const idem = req.headers.get(HEADER.idempotency);
++      if (!idem || !/^[\w:.-]{8,120}$/.test(idem)) return { status: 400, body: { error: "Idempotency-Key mancante" } };
++      const { data, error } = await admin.rpc("integration_set_occurrence_status", {
++        p_ws: cfg.workspaceId,
++        p_occurrence: occ,
++        p_status: parsed.data.status,
++        p_actor: cfg.actorId,
++        p_base_version: parsed.data.base_version,
++      });
++      if (error) throw new Error(error.message);
++      const r = data as { result: StatusResponse["result"]; status: StatusResponse["status"]; version: string | null; completed_at: string | null };
++      const body: StatusResponse = { protocol: PROTOCOL_VERSION, result: r.result, status: r.status, version: iso(r.version), completed_at: iso(r.completed_at) };
++      return { status: r.result === "conflict" ? 409 : r.result === "not_found" ? 404 : 200, body };
++    }
++
++    return { status: 405, body: { error: "Metodo non consentito" } };
++  } catch (e) {
++    log.error("personal-os: errore", e);
++    return { status: 500, body: { error: redact(e, 200) } };
++  }
++}
+diff --git a/src/proxy.ts b/src/proxy.ts
+index b404dbc..753874a 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -73,6 +73,6 @@ export async function proxy(request: NextRequest) {
+ export const config = {
+   matcher: [
+     // escludi asset statici e webhook/cron machine-to-machine (autenticati da segreto)
+-    "/((?!_next/static|_next/image|favicon.ico|icon.png|apple-icon.png|manifest.webmanifest|brand/|api/telegram/webhook|api/cron|api/security/ingest|api/health).*)",
++    "/((?!_next/static|_next/image|favicon.ico|icon.png|apple-icon.png|manifest.webmanifest|brand/|api/telegram/webhook|api/cron|api/security/ingest|api/integrations/personal-os|api/health).*)",
+   ],
+ };
+diff --git a/supabase/migrations/20261126000001_personal_os_integration.sql b/supabase/migrations/20261126000001_personal_os_integration.sql
+new file mode 100644
+index 0000000..212708e
+--- /dev/null
++++ b/supabase/migrations/20261126000001_personal_os_integration.sql
+@@ -0,0 +1,106 @@
++-- IronEdge Growth OS - interfaccia di integrazione con Personal OS (migrazione ADDITIVA)
++-- * nuove colonne opzionali sulle task (NULL = non indicato): nessun impatto sul codice esistente;
++-- * tabella nonce per la protezione da replay delle richieste firmate;
++-- * due funzioni SOLO service role, limitate a un workspace, usate dall'API firmata.
++-- Rollback: supabase/rollback/20261126000001_down.sql
++
++alter table public.tasks
++  add column if not exists priority smallint check (priority is null or priority between 1 and 4),
++  add column if not exists estimated_minutes integer check (estimated_minutes is null or estimated_minutes between 5 and 1440),
++  add column if not exists category text check (category is null or char_length(category) <= 80),
++  add column if not exists depends_on uuid[] not null default '{}';
++
++-- versione dell'occorrenza per il rilevamento dei conflitti
++create index if not exists task_occ_ws_updated_idx on public.task_occurrences(workspace_id, updated_at);
++create index if not exists tasks_ws_updated_idx on public.tasks(workspace_id, updated_at);
++
++-- nonce monouso (finestra 10 minuti), nessun accesso utente
++create table public.integration_nonces (
++  nonce text primary key check (nonce ~ '^[a-f0-9]{32}$'),
++  client text not null check (client in ('personal_os')),
++  received_at timestamptz not null default now()
++);
++alter table public.integration_nonces enable row level security;
++alter table public.integration_nonces force row level security;
++revoke all on public.integration_nonces from anon, authenticated;
++grant all on public.integration_nonces to service_role;
++
++create or replace function public.integration_use_nonce(p_nonce text) returns boolean
++language plpgsql security definer set search_path = '' as $$
++declare n integer;
++begin
++  if not app.is_service() then raise exception 'Solo service role' using errcode = '42501'; end if;
++  delete from public.integration_nonces where received_at < now() - interval '10 minutes';
++  insert into public.integration_nonces (nonce, client) values (p_nonce, 'personal_os') on conflict do nothing;
++  get diagnostics n = row_count;
++  return n = 1;
++end $$;
++
++-- Elenco incrementale delle occorrenze (cursore = versione massima vista)
++create or replace function public.integration_list_tasks(p_ws uuid, p_since timestamptz, p_from date, p_to date, p_limit integer default 200)
++returns table (
++  occurrence_id uuid, task_id uuid, title text, description text, priority smallint, due_date date,
++  occurrence_date date, estimated_minutes integer, status public.occurrence_status, category text,
++  depends_on uuid[], completed_at timestamptz, version timestamptz, task_active boolean
++)
++language plpgsql stable security definer set search_path = '' as $$
++begin
++  if not app.is_service() then raise exception 'Solo service role' using errcode = '42501'; end if;
++  return query
++  select o.id, t.id, t.title, t.description, t.priority, t.due_date, o.occurrence_date, t.estimated_minutes,
++         o.status, t.category, t.depends_on, o.completed_at, greatest(o.updated_at, t.updated_at) as version, t.active
++    from public.task_occurrences o
++    join public.tasks t on t.id = o.task_id
++   where o.workspace_id = p_ws
++     and o.occurrence_date between p_from and p_to
++     and (p_since is null or greatest(o.updated_at, t.updated_at) > p_since)
++   order by greatest(o.updated_at, t.updated_at), o.id
++   limit greatest(1, least(p_limit, 500));
++end $$;
++
++-- Cambio di stato da Personal OS. IronEdge resta autorevole:
++--  * stato gia' uguale -> noop (idempotente);
++--  * occorrenza modificata in IronEdge dopo la versione nota a Personal OS -> conflict (nessuna scrittura);
++--  * l'attore deve essere owner/editor del workspace.
++create or replace function public.integration_set_occurrence_status(
++  p_ws uuid, p_occurrence uuid, p_status public.occurrence_status, p_actor uuid, p_base_version timestamptz
++) returns jsonb
++language plpgsql security definer set search_path = '' as $$
++declare o public.task_occurrences%rowtype; ver timestamptz;
++begin
++  if not app.is_service() then raise exception 'Solo service role' using errcode = '42501'; end if;
++  if p_status not in ('open', 'done') then raise exception 'Stato non consentito' using errcode = '22023'; end if;
++  if not exists (select 1 from public.memberships m where m.workspace_id = p_ws and m.user_id = p_actor and m.role in ('owner', 'editor')) then
++    raise exception 'Attore non autorizzato sul workspace' using errcode = '42501';
++  end if;
++  select * into o from public.task_occurrences where id = p_occurrence and workspace_id = p_ws for update;
++  if not found then
++    return jsonb_build_object('result', 'not_found', 'status', null, 'version', null, 'completed_at', null);
++  end if;
++  select greatest(o.updated_at, t.updated_at) into ver from public.tasks t where t.id = o.task_id;
++  if o.status = p_status then
++    return jsonb_build_object('result', 'noop', 'status', o.status, 'version', ver, 'completed_at', o.completed_at);
++  end if;
++  if p_base_version is not null and o.updated_at > p_base_version then
++    return jsonb_build_object('result', 'conflict', 'status', o.status, 'version', ver, 'completed_at', o.completed_at);
++  end if;
++  update public.task_occurrences
++     set status = p_status,
++         completed_at = case when p_status = 'done' then now() else null end,
++         completed_by = case when p_status = 'done' then p_actor else null end
++   where id = o.id
++  returning * into o;
++  insert into public.audit_events (workspace_id, actor_id, action, entity, entity_id, changes)
++  values (p_ws, p_actor, 'personal_os_status', 'task_occurrences', o.id, jsonb_build_object('fields', array['status']));
++  select greatest(o.updated_at, t.updated_at) into ver from public.tasks t where t.id = o.task_id;
++  return jsonb_build_object('result', 'applied', 'status', o.status, 'version', ver, 'completed_at', o.completed_at);
++end $$;
++
++revoke execute on function public.integration_use_nonce(text),
++  public.integration_list_tasks(uuid, timestamptz, date, date, integer),
++  public.integration_set_occurrence_status(uuid, uuid, public.occurrence_status, uuid, timestamptz)
++  from authenticated, anon, public;
++grant execute on function public.integration_use_nonce(text),
++  public.integration_list_tasks(uuid, timestamptz, date, date, integer),
++  public.integration_set_occurrence_status(uuid, uuid, public.occurrence_status, uuid, timestamptz)
++  to service_role;
+diff --git a/supabase/rollback/20261126000001_down.sql b/supabase/rollback/20261126000001_down.sql
+new file mode 100644
+index 0000000..fd27ba1
+--- /dev/null
++++ b/supabase/rollback/20261126000001_down.sql
+@@ -0,0 +1,14 @@
++-- Rollback della migrazione 20261126000001 (integrazione Personal OS).
++-- Eseguire solo con approvazione e dopo un backup verificato.
++-- Le colonne aggiunte alle task sono opzionali: rimuoverle elimina solo priorita'/durata/categoria/dipendenze.
++drop function if exists public.integration_set_occurrence_status(uuid, uuid, public.occurrence_status, uuid, timestamptz);
++drop function if exists public.integration_list_tasks(uuid, timestamptz, date, date, integer);
++drop function if exists public.integration_use_nonce(text);
++drop table if exists public.integration_nonces;
++drop index if exists public.task_occ_ws_updated_idx;
++drop index if exists public.tasks_ws_updated_idx;
++alter table public.tasks
++  drop column if exists depends_on,
++  drop column if exists category,
++  drop column if exists estimated_minutes,
++  drop column if exists priority;
+diff --git a/tests/db/backup-restore.test.ts b/tests/db/backup-restore.test.ts
+index 3653d82..dcfb1fc 100644
+--- a/tests/db/backup-restore.test.ts
++++ b/tests/db/backup-restore.test.ts
+@@ -6,12 +6,12 @@ import { createDb } from "./harness";
+ const sql = (p: string) => readFileSync(join(process.cwd(), p), "utf8");
+ 
+ describe("script di verifica del backup", () => {
+-  it("row-counts.sql restituisce 'tabella|righe' per tutte le 27 tabelle, ordinate", async () => {
++  it("row-counts.sql restituisce 'tabella|righe' per tutte le 28 tabelle, ordinate", async () => {
+     const db = await createDb();
+     await db.as("aaaaaaaa-0000-4000-8000-000000000001", () => db.query("select public.create_workspace('Conta')"));
+     const results = await db.exec(sql("supabase/tests/row-counts.sql"));
+     const rows = results[results.length - 1].rows.map((r) => Object.values(r)[0] as string);
+-    expect(rows).toHaveLength(27);
++    expect(rows).toHaveLength(28);
+     expect(rows).toEqual([...rows].sort());
+     expect(rows).toContain("tasks|6");
+     expect(rows).toContain("workspaces|1");
+diff --git a/tests/db/personal-os.test.ts b/tests/db/personal-os.test.ts
+new file mode 100644
+index 0000000..60e6e83
+--- /dev/null
++++ b/tests/db/personal-os.test.ts
+@@ -0,0 +1,92 @@
++import { beforeAll, describe, expect, it } from "vitest";
++import { createDb, type Db, USER_A, USER_B, USER_C } from "./harness";
++
++let db: Db;
++let wsA: string;
++let wsB: string;
++let occA: string;
++let occB: string;
++
++async function one<T>(sql: string, params: unknown[] = []): Promise<T> {
++  return (await db.query<T>(sql, params)).rows[0];
++}
++
++beforeAll(async () => {
++  db = await createDb();
++  wsA = await db.as(USER_A, async () => (await one<{ id: string }>("select public.create_workspace('IronEdge A') id")).id);
++  wsB = await db.as(USER_B, async () => (await one<{ id: string }>("select public.create_workspace('Tenant B') id")).id);
++  await db.as(USER_A, () => db.query("insert into public.memberships (workspace_id, user_id, role) values ($1, $2, 'analyst')", [wsA, USER_C]));
++  await db.as(USER_A, () => db.query("select public.generate_task_occurrences($1, '2026-11-26')", [wsA]));
++  await db.as(USER_B, () => db.query("select public.generate_task_occurrences($1, '2026-11-26')", [wsB]));
++  occA = (await db.asService(() => one<{ id: string }>("select id from public.task_occurrences where workspace_id = $1 limit 1", [wsA]))).id;
++  occB = (await db.asService(() => one<{ id: string }>("select id from public.task_occurrences where workspace_id = $1 limit 1", [wsB]))).id;
++}, 60_000);
++
++describe("integrazione Personal OS (DB)", () => {
++  it("le nuove colonne sono opzionali: il codice esistente continua a inserire task", async () => {
++    await db.as(USER_A, async () => {
++      await db.query("insert into public.tasks (workspace_id, title, recurrence) values ($1, 'Task legacy', 'daily')", [wsA]);
++      const t = await one<{ priority: number | null; depends_on: string[] }>("select priority, depends_on from public.tasks where title = 'Task legacy'");
++      expect(t.priority).toBeNull();
++      expect(t.depends_on).toEqual([]);
++    });
++  });
++
++  it("funzioni riservate al service role", async () => {
++    await db.as(USER_A, async () => {
++      await expect(db.query("select * from public.integration_list_tasks($1, null, '2026-11-01', '2026-11-30', 10)", [wsA])).rejects.toThrow(/permission denied|Solo service/);
++      await expect(db.query("select public.integration_use_nonce('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')")).rejects.toThrow(/permission denied|Solo service/);
++      await expect(db.query("select * from public.integration_nonces")).rejects.toThrow(/permission denied/);
++    });
++  });
++
++  it("list: solo il workspace richiesto, cursore incrementale", async () => {
++    await db.asService(async () => {
++      const all = await db.query<{ occurrence_id: string; version: string }>("select * from public.integration_list_tasks($1, null, '2026-11-26', '2026-11-26', 100)", [wsA]);
++      expect(all.rows.length).toBe(6);
++      expect(all.rows.some((r) => r.occurrence_id === occB)).toBe(false);
++      const maxVer = all.rows[all.rows.length - 1].version;
++      const none = await db.query("select * from public.integration_list_tasks($1, $2, '2026-11-26', '2026-11-26', 100)", [wsA, maxVer]);
++      expect(none.rows.length).toBe(0);
++    });
++  });
++
++  it("nonce monouso (replay)", async () => {
++    await db.asService(async () => {
++      expect((await one<{ ok: boolean }>("select public.integration_use_nonce('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb') ok")).ok).toBe(true);
++      expect((await one<{ ok: boolean }>("select public.integration_use_nonce('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb') ok")).ok).toBe(false);
++    });
++  });
++
++  it("set status: applied, poi noop idempotente, con audit e completed_by = attore", async () => {
++    await db.asService(async () => {
++      const r1 = await one<{ r: { result: string; status: string } }>("select public.integration_set_occurrence_status($1, $2, 'done', $3, null) r", [wsA, occA, USER_A]);
++      expect(r1.r.result).toBe("applied");
++      const o = await one<{ status: string; completed_by: string }>("select status, completed_by from public.task_occurrences where id = $1", [occA]);
++      expect(o).toEqual({ status: "done", completed_by: USER_A });
++      const r2 = await one<{ r: { result: string } }>("select public.integration_set_occurrence_status($1, $2, 'done', $3, null) r", [wsA, occA, USER_A]);
++      expect(r2.r.result).toBe("noop");
++      const audit = await one<{ n: number }>("select count(*)::int n from public.audit_events where entity_id = $1 and action = 'personal_os_status'", [occA]);
++      expect(audit.n).toBe(1);
++    });
++  });
++
++  it("conflitto: modifica in IronEdge successiva alla versione nota -> nessuna scrittura", async () => {
++    await db.asService(async () => {
++      const old = "2000-01-01T00:00:00Z";
++      const r = await one<{ r: { result: string; status: string } }>("select public.integration_set_occurrence_status($1, $2, 'open', $3, $4) r", [wsA, occA, USER_A, old]);
++      expect(r.r.result).toBe("conflict");
++      expect((await one<{ status: string }>("select status from public.task_occurrences where id = $1", [occA])).status).toBe("done");
++    });
++  });
++
++  it("isolamento: occorrenza di un altro workspace = not_found; attore analyst o estraneo rifiutato", async () => {
++    await db.asService(async () => {
++      const r = await one<{ r: { result: string } }>("select public.integration_set_occurrence_status($1, $2, 'done', $3, null) r", [wsA, occB, USER_A]);
++      expect(r.r.result).toBe("not_found");
++      await expect(db.query("select public.integration_set_occurrence_status($1, $2, 'done', $3, null)", [wsA, occA, USER_C])).rejects.toThrow(/non autorizzato/);
++      await expect(db.query("select public.integration_set_occurrence_status($1, $2, 'done', $3, null)", [wsA, occA, USER_B])).rejects.toThrow(/non autorizzato/);
++      await expect(db.query("select public.integration_set_occurrence_status($1, $2, 'skipped', $3, null)", [wsA, occA, USER_A])).rejects.toThrow(/non consentito/);
++    });
++  });
++});
+diff --git a/tests/db/rollback.test.ts b/tests/db/rollback.test.ts
+index be68be0..5020465 100644
+--- a/tests/db/rollback.test.ts
++++ b/tests/db/rollback.test.ts
+@@ -11,6 +11,7 @@ describe("rollback e smoke test schema", () => {
+ 
+   it("rollback completo e riapplicazione delle migrazioni (ciclo up/down/up)", async () => {
+     const db = await createDb();
++    await db.exec(readFileSync(join(process.cwd(), "supabase/rollback/20261126000001_down.sql"), "utf8"));
+     await db.exec(readFileSync(join(process.cwd(), "supabase/rollback/20261125000004_down.sql"), "utf8"));
+     await db.exec(readFileSync(join(process.cwd(), "supabase/rollback/20261125000001-3_down.sql"), "utf8"));
+     const left = await db.query<{ n: number }>("select count(*)::int n from pg_tables where schemaname='public'");
+@@ -18,6 +19,6 @@ describe("rollback e smoke test schema", () => {
+     const dir = join(process.cwd(), "supabase/migrations");
+     for (const f of readdirSync(dir).sort()) await db.exec(readFileSync(join(dir, f), "utf8"));
+     const again = await db.query<{ n: number }>("select count(*)::int n from pg_tables where schemaname='public'");
+-    expect(again.rows[0].n).toBe(27);
++    expect(again.rows[0].n).toBe(28);
+   }, 60_000);
+ });
+diff --git a/tests/unit/personal-os.test.ts b/tests/unit/personal-os.test.ts
+new file mode 100644
+index 0000000..4973c9d
+--- /dev/null
++++ b/tests/unit/personal-os.test.ts
+@@ -0,0 +1,120 @@
++import type { SupabaseClient } from "@supabase/supabase-js";
++import { describe, expect, it, vi } from "vitest";
++import type { ServerEnv } from "@/lib/env";
++import { handlePersonalOs } from "@/lib/personal-os";
++import { HEADER, signedHeaders, verifySignedRequest } from "@/lib/personal-os-protocol";
++
++const SECRET = "s".repeat(40);
++const WS = "11111111-1111-4111-8111-111111111111";
++const ACTOR = "22222222-2222-4222-8222-222222222222";
++const OCC = "33333333-3333-4333-8333-333333333333";
++const env = (over: Partial<ServerEnv> = {}): ServerEnv => ({
++  AI_PROVIDER: "none",
++  AI_MODEL: "claude-opus-5-5",
++  AI_MONTHLY_BUDGET_USD: 0,
++  AI_MAX_REQUESTS_PER_DAY: 20,
++  PERSONAL_OS_SHARED_SECRET: SECRET,
++  PERSONAL_OS_WORKSPACE_ID: WS,
++  PERSONAL_OS_ACTOR_USER_ID: ACTOR,
++  ...over,
++});
++
++function fakeAdmin(rpcImpl: (fn: string, args: Record<string, unknown>) => { data: unknown; error: null | { message: string } }) {
++  const rpc = vi.fn(async (fn: string, args: Record<string, unknown>) => rpcImpl(fn, args));
++  return { client: { rpc } as unknown as SupabaseClient, rpc };
++}
++
++const BASE = "https://ironedge.example.com";
++function signed(method: string, path: string, body = "", now = Date.now(), extra: Record<string, string> = {}) {
++  return { method, url: BASE + path, body, headers: new Headers({ ...signedHeaders(SECRET, method, path, body, now), ...extra }) };
++}
++
++describe("protocollo firmato", () => {
++  it("firma valida accettata; corpo o path manomessi rifiutati", () => {
++    const now = Date.now();
++    const h = new Headers(signedHeaders(SECRET, "POST", "/api/x", '{"a":1}', now));
++    expect(verifySignedRequest(SECRET, { method: "POST", path: "/api/x", headers: h, body: '{"a":1}' }, now).ok).toBe(true);
++    expect(verifySignedRequest(SECRET, { method: "POST", path: "/api/x", headers: h, body: '{"a":2}' }, now).ok).toBe(false);
++    expect(verifySignedRequest(SECRET, { method: "POST", path: "/api/y", headers: h, body: '{"a":1}' }, now).ok).toBe(false);
++    expect(verifySignedRequest("x".repeat(40), { method: "POST", path: "/api/x", headers: h, body: '{"a":1}' }, now).ok).toBe(false);
++  });
++  it("timestamp fuori finestra rifiutato", () => {
++    const now = Date.now();
++    const h = new Headers(signedHeaders(SECRET, "GET", "/a", "", now - 10 * 60_000));
++    expect(verifySignedRequest(SECRET, { method: "GET", path: "/a", headers: h, body: "" }, now)).toMatchObject({ ok: false, status: 401 });
++  });
++  it("segreto corto non utilizzabile", () => {
++    expect(() => signedHeaders("short", "GET", "/a")).toThrow();
++  });
++});
++
++describe("handler API Personal OS", () => {
++  it("503 se non configurata, senza toccare il database", async () => {
++    const { client, rpc } = fakeAdmin(() => ({ data: null, error: null }));
++    const r = await handlePersonalOs(client, env({ PERSONAL_OS_SHARED_SECRET: undefined }), signed("GET", "/api/integrations/personal-os"));
++    expect(r.status).toBe(503);
++    expect(rpc).not.toHaveBeenCalled();
++  });
++
++  it("401 su firma errata; replay rifiutato", async () => {
++    const { client } = fakeAdmin((fn) => ({ data: fn === "integration_use_nonce" ? false : [], error: null }));
++    const bad = signed("GET", "/api/integrations/personal-os?from=2026-11-01&to=2026-11-30");
++    bad.headers.set(HEADER.signature, "0".repeat(64));
++    expect((await handlePersonalOs(client, env(), bad)).status).toBe(401);
++    const replay = await handlePersonalOs(client, env(), signed("GET", "/api/integrations/personal-os?from=2026-11-01&to=2026-11-30"));
++    expect(replay.status).toBe(401);
++  });
++
++  it("GET: usa SEMPRE il workspace configurato e mappa il contratto", async () => {
++    const row = {
++      occurrence_id: OCC, task_id: WS, title: "Preparare la live", description: null, priority: 2, due_date: null,
++      occurrence_date: "2026-11-26", estimated_minutes: 45, status: "open", category: "live", depends_on: null,
++      completed_at: null, version: "2026-11-26T08:00:00+00:00", task_active: true,
++    };
++    const { client, rpc } = fakeAdmin((fn) => ({ data: fn === "integration_use_nonce" ? true : [row], error: null }));
++    const r = await handlePersonalOs(client, env(), signed("GET", "/api/integrations/personal-os?from=2026-11-20&to=2026-12-10&limit=50"));
++    expect(r.status).toBe(200);
++    const body = r.body as { items: { url: string; depends_on: string[]; version: string }[]; next_cursor: string; has_more: boolean };
++    expect(body.items[0].depends_on).toEqual([]);
++    expect(body.items[0].url).toBe(`${BASE}/impostazioni#task-${WS}`);
++    expect(body.next_cursor).toBe("2026-11-26T08:00:00.000Z");
++    expect(rpc.mock.calls.find((c) => c[0] === "integration_list_tasks")?.[1]).toMatchObject({ p_ws: WS, p_limit: 51 });
++  });
++
++  it("GET: intervallo date eccessivo rifiutato", async () => {
++    const { client } = fakeAdmin(() => ({ data: true, error: null }));
++    const r = await handlePersonalOs(client, env(), signed("GET", "/api/integrations/personal-os?from=2026-01-01&to=2026-12-31"));
++    expect(r.status).toBe(400);
++  });
++
++  it("POST: campi extra (es. dati personali) rifiutati dallo schema strict", async () => {
++    const { client, rpc } = fakeAdmin(() => ({ data: true, error: null }));
++    const body = JSON.stringify({ external_id: `occ:${OCC}`, status: "done", base_version: null, sleep_hours: 6 });
++    const r = await handlePersonalOs(client, env(), signed("POST", "/api/integrations/personal-os", body, Date.now(), { [HEADER.idempotency]: "task:abc:12345678" }));
++    expect(r.status).toBe(400);
++    expect(rpc.mock.calls.some((c) => c[0] === "integration_set_occurrence_status")).toBe(false);
++  });
++
++  it("POST: applica con attore configurato; conflitto -> 409 con stato IronEdge", async () => {
++    let result = "applied";
++    const { client, rpc } = fakeAdmin((fn) =>
++      fn === "integration_use_nonce"
++        ? { data: true, error: null }
++        : { data: { result, status: result === "applied" ? "done" : "skipped", version: "2026-11-26T09:00:00Z", completed_at: null }, error: null },
++    );
++    const body = JSON.stringify({ external_id: `occ:${OCC}`, status: "done", base_version: "2026-11-26T08:00:00.000Z" });
++    const ok = await handlePersonalOs(client, env(), signed("POST", "/api/integrations/personal-os", body, Date.now(), { [HEADER.idempotency]: "task:abc:12345678" }));
++    expect(ok.status).toBe(200);
++    expect(rpc.mock.calls.find((c) => c[0] === "integration_set_occurrence_status")?.[1]).toMatchObject({ p_ws: WS, p_actor: ACTOR, p_occurrence: OCC, p_status: "done" });
++    result = "conflict";
++    const conflict = await handlePersonalOs(client, env(), signed("POST", "/api/integrations/personal-os", body, Date.now(), { [HEADER.idempotency]: "task:abc:99999999" }));
++    expect(conflict.status).toBe(409);
++    expect((conflict.body as { status: string }).status).toBe("skipped");
++  });
++
++  it("POST senza Idempotency-Key rifiutato", async () => {
++    const { client } = fakeAdmin(() => ({ data: true, error: null }));
++    const body = JSON.stringify({ external_id: `occ:${OCC}`, status: "done", base_version: null });
++    expect((await handlePersonalOs(client, env(), signed("POST", "/api/integrations/personal-os", body))).status).toBe(400);
++  });
++});
+-- 
+2.43.0
+
