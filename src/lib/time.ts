@@ -133,3 +133,6 @@ export function formatDuration(minutes: number | null | undefined): string {
 export function dayBoundsUtc(dateStr: string, timeZone = DEFAULT_TZ): { start: Date; end: Date } {
   return { start: zonedToUtc(dateStr, "00:00", timeZone), end: zonedToUtc(addDays(dateStr, 1), "00:00", timeZone) };
 }
+
+/** Istante corrente (ms): funzione esplicita per l'uso nei Server Components. */
+export const currentTimeMs = (): number => Date.now();

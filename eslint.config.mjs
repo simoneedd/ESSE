@@ -10,6 +10,7 @@ const config = [
       "no-eval": "error",
       "no-implied-eval": "error",
       "react/no-danger": "error",
+      "@typescript-eslint/no-unused-vars": ["warn", { varsIgnorePattern: "^_", argsIgnorePattern: "^_", ignoreRestSiblings: true }],
     },
   },
 ];

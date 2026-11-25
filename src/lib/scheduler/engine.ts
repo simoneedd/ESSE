@@ -189,7 +189,7 @@ export function planDay(input: PlanInput): PlanResult {
   const breakMin = s.breakMinutes ?? 15;
   const warnings: string[] = [];
 
-  let wake = hhmmToMinutes(input.actualWake ?? s.targetWake);
+  const wake = hhmmToMinutes(input.actualWake ?? s.targetWake);
   let bed = hhmmToMinutes(s.targetBedtime);
   if (bed <= wake) bed += 1440; // coricarsi dopo mezzanotte
   // il sonno e' protetto: se l'obiettivo di sonno non entra tra coricarsi e sveglia di domani, si anticipa il coricarsi
