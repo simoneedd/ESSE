@@ -1,4 +1,4 @@
-From 1c10df6ccc2ddc18b04605a9816fd27155e4509c Mon Sep 17 00:00:00 2001
+From 965a3b3f00c3dd74a244ab37fbdf46c684570022 Mon Sep 17 00:00:00 2001
 From: Personal OS integration <noreply@anthropic.com>
 Date: Wed, 25 Nov 2026 22:39:46 +0000
 Subject: [PATCH] feat: interfaccia di integrazione Personal OS (API firmata
@@ -17,7 +17,7 @@ Claude-Session: https://claude.ai/code/session_01SETgpiT5SrZGcDegL6YCTU
  src/app/api/integrations/personal-os/route.ts |  26 +++
  src/lib/env.ts                                |   4 +
  src/lib/personal-os-protocol.ts               | 141 +++++++++++++++
- src/lib/personal-os.ts                        | 165 ++++++++++++++++++
+ src/lib/personal-os.ts                        | 167 ++++++++++++++++++
  src/proxy.ts                                  |   2 +-
  ...20261126000001_personal_os_integration.sql | 106 +++++++++++
  supabase/rollback/20261126000001_down.sql     |  14 ++
@@ -25,7 +25,7 @@ Claude-Session: https://claude.ai/code/session_01SETgpiT5SrZGcDegL6YCTU
  tests/db/personal-os.test.ts                  |  92 ++++++++++
  tests/db/rollback.test.ts                     |   3 +-
  tests/unit/personal-os.test.ts                | 120 +++++++++++++
- 12 files changed, 678 insertions(+), 4 deletions(-)
+ 12 files changed, 680 insertions(+), 4 deletions(-)
  create mode 100644 src/app/api/integrations/personal-os/route.ts
  create mode 100644 src/lib/personal-os-protocol.ts
  create mode 100644 src/lib/personal-os.ts
@@ -243,10 +243,10 @@ index 0000000..6dd5ed0
 +};
 diff --git a/src/lib/personal-os.ts b/src/lib/personal-os.ts
 new file mode 100644
-index 0000000..e9dcbe4
+index 0000000..141b222
 --- /dev/null
 +++ b/src/lib/personal-os.ts
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,167 @@
 +import type { SupabaseClient } from "@supabase/supabase-js";
 +import { z } from "zod";
 +import type { ServerEnv } from "./env";
@@ -299,7 +299,9 @@ index 0000000..e9dcbe4
 +  task_active: boolean;
 +};
 +
-+const iso = (v: string | null) => (v ? new Date(v).toISOString() : null);
++const iso = (v: string | Date | null) => (v ? new Date(v).toISOString() : null);
++/** PostgREST restituisce le date come stringhe, i driver Postgres come Date: normalizza a YYYY-MM-DD. */
++const dateOnly = (v: string | Date | null): string | null => (v == null ? null : v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
 +
 +async function authenticate(
 +  admin: SupabaseClient,
@@ -359,8 +361,8 @@ index 0000000..e9dcbe4
 +        title: r.title,
 +        description: r.description,
 +        priority: r.priority,
-+        due_date: r.due_date,
-+        occurrence_date: r.occurrence_date,
++        due_date: dateOnly(r.due_date),
++        occurrence_date: dateOnly(r.occurrence_date)!,
 +        estimated_minutes: r.estimated_minutes,
 +        status: r.status,
 +        category: r.category,

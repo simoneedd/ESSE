@@ -13,7 +13,7 @@ import { sleepStats } from "./sleep";
 import { createIronEdgeClient, runIronEdgeSync } from "./sync/ironedge";
 import { supabaseSyncStore } from "./sync/store-supabase";
 import { sendTelegramMessage } from "./telegram";
-import { addDays, dayBoundsUtc, formatDuration, formatTime, hhmmToMinutes, localDate, minutesToHhmm, weekStart, zonedParts, zonedToUtc } from "./time";
+import { addDays, dayBoundsUtc, formatDuration, formatTime, hhmmToMinutes, localDate, weekStart, zonedParts, zonedToUtc } from "./time";
 
 export type DueJob = { job: string; key: string };
 
@@ -210,9 +210,10 @@ export async function runForUser(admin: SupabaseClient, env: ServerEnv, profile:
             return { sent };
           }
           case "weekly_report": {
-            const start = addDays(key, -7);
-            const r = await buildWeekly(admin, profile, start, addDays(key, -1));
-            await admin.from("reports").upsert({ user_id: profile.user_id, kind: "weekly", period_start: start, period_end: addDays(key, -1), content: r }, { onConflict: "user_id,kind,period_start" });
+            // settimana corrente (lunedi' -> oggi): il report parte nel giorno/ora scelti, di default domenica sera
+            const start = key;
+            const r = await buildWeekly(admin, profile, start, day);
+            await admin.from("reports").upsert({ user_id: profile.user_id, kind: "weekly", period_start: start, period_end: day, content: r }, { onConflict: "user_id,kind,period_start" });
             await notify(admin, env, profile, "weekly", `Report settimanale ${start}`, [`Lavoro: ${formatDuration(r.workMinutes)} (media ${formatDuration(r.avgWorkPerDay)}/giorno)`, `Task completate ${r.tasks.completed}, rimandate ${r.tasks.postponed}`, ...r.suggestions.slice(0, 4).map((s) => `• ${s}`)].join("\n"), `weekly:${start}`);
             return { suggestions: r.suggestions.length };
           }
@@ -247,4 +248,3 @@ export async function runScheduler(admin: SupabaseClient, env: ServerEnv, now = 
   return out;
 }
 
-export const _test = { minutesToHhmm };

@@ -171,3 +171,23 @@ describe("Smart Scheduler", () => {
     expect(slots.every((s) => s.startMin >= 18 * 60 && s.endMin <= plans[0].dayEndMin)).toBe(true);
   });
 });
+
+describe("Smart Scheduler: qualita' della collocazione", () => {
+  it("non spezza attivita' brevi e colloca studio/palestra fuori dall'orario di lavoro se possibile", () => {
+    const r = planDay({
+      date: DAY,
+      settings,
+      fixed: [],
+      tasks: [
+        task({ id: "lavoro", area: "marketing", estimatedMinutes: 120, priority: 1 }),
+        task({ id: "studio", area: "study", estimatedMinutes: 45, priority: 3 }),
+        task({ id: "palestra", area: "gym", estimatedMinutes: 60, priority: 2 }),
+      ],
+    });
+    for (const id of ["studio", "palestra"]) {
+      const parts = r.blocks.filter((b) => b.refId === id);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].startMin >= 18 * 60 || parts[0].endMin <= 9 * 60).toBe(true);
+    }
+  });
+});

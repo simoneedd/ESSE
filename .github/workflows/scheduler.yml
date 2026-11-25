@@ -1,0 +1,39 @@
+name: Scheduler applicativo
+
+# Trigger ogni 15 minuti: l app decide in ora locale (DST-safe) quali job sono dovuti, con lock e idempotenza.
+# Limiti noti GitHub: i cron sono in UTC, possono ritardare nei momenti di carico e vengono
+# sospesi dopo 60 giorni di inattivita' del repository pubblico.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduler
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Chiama /api/cron
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "APP_URL o CRON_SECRET non configurati: scheduler inattivo."; exit 0
+          fi
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o response.json -w '%{http_code}' -X POST "$APP_URL/api/cron" \
+              -H "Authorization: Bearer $CRON_SECRET" --max-time 60) || code=000
+            echo "Tentativo $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then jq '{ok, ranAt, jobs: [.results[] | {job, key, status}]}' response.json; exit 0; fi
+            [ "$code" = "401" ] && exit 1
+            sleep $((attempt * 20))
+          done
+          exit 1

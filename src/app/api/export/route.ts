@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isSupabaseConfigured } from "@/lib/env";
 import { rateLimit } from "@/lib/security";
 import { supabaseServer } from "@/lib/supabase/server";
 
@@ -13,6 +14,7 @@ const TABLES = [
 
 /** Export completo dei propri dati (portabilita'), letto con RLS: solo righe dell'utente. Nessun token. */
 export async function GET() {
+  if (!isSupabaseConfigured()) return NextResponse.json({ error: "Non configurato" }, { status: 503 });
   const db = await supabaseServer();
   const { data } = await db.auth.getUser();
   if (!data.user) return NextResponse.json({ error: "Non autenticato" }, { status: 401 });

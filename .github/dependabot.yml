@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Rome
+    open-pull-requests-limit: 10
+    labels: [dependencies]
+    groups:
+      patch-updates:
+        update-types: [patch]
+      minor-updates:
+        update-types: [minor]
+    # gli aggiornamenti major arrivano come PR singole e richiedono sempre revisione umana
+    ignore:
+      # eslint 10: i plugin di eslint-config-next@16 dichiarano peer eslint <= 9 (verificato 2026-11-25).
+      # Rimuovere quando eslint-config-next supportera' eslint 10.
+      - dependency-name: eslint
+        update-types: ["version-update:semver-major"]
+      # TypeScript 7 (compilatore nativo): compatibilita' con il typecheck di Next 16 non verificata.
+      # Rimuovere dopo una prova locale di `npm run check` con TypeScript 7.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Europe/Rome
+    labels: [dependencies, ci]

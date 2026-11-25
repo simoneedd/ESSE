@@ -1,0 +1,73 @@
+name: Correzione controllata vulnerabilita'
+
+# Applica solo correzioni a basso rischio (npm audit fix SENZA --force: nessun salto di major),
+# esegue l'intera suite di regressione e, solo se verde, apre una PR su branch dedicato.
+# Non fa mai merge: il merge segue la branch protection e la policy AUTO_MERGE_POLICY.
+# Nota: le PR create con GITHUB_TOKEN non avviano altri workflow; per questo i controlli
+# completi girano qui prima di aprire la PR (e il risultato e' riportato nella PR).
+on:
+  schedule:
+    - cron: "41 5 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci --no-fund
+      - name: npm audit fix (senza --force)
+        id: fix
+        run: |
+          npm audit fix --no-fund || true
+          if git diff --quiet -- package.json package-lock.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; echo "Nessuna correzione automatica disponibile."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            # protezione: rifiuta modifiche che cambiano la major di dipendenze dirette
+            node -e '
+              const { execSync } = require("child_process");
+              const before = JSON.parse(execSync("git show HEAD:package.json").toString());
+              const after = require("./package.json");
+              const all = (p) => ({ ...p.dependencies, ...p.devDependencies });
+              const b = all(before), a = all(after);
+              const major = (v) => String(v).replace(/^[^0-9]*/, "").split(".")[0];
+              const bad = Object.keys(a).filter((k) => b[k] && major(a[k]) !== major(b[k]));
+              if (bad.length) { console.error("Cambio di major non consentito:", bad); process.exit(1); }
+            '
+          fi
+      - name: Regressione completa
+        if: steps.fix.outputs.changed == 'true'
+        run: |
+          npm run lint
+          npm run typecheck
+          npm test
+          npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - name: Apri PR
+        if: steps.fix.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="security/autofix-$(date -u +%Y%m%d)"
+          git config user.name "personal-os-security-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add package.json package-lock.json
+          git commit -m "fix(security): npm audit fix (patch/minor, regressione superata)"
+          git push --force-with-lease origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" --label dependencies --title "Security: correzioni automatiche $(date -u +%F)" \
+            --body "Correzioni generate da \`npm audit fix\` senza \`--force\` (nessun salto di major). Lint, typecheck, test e build eseguiti nel workflow ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}: verdi. Rollback: chiudere la PR o \`git revert\` del merge commit." \
+            || echo "PR gia' esistente per questo branch."

@@ -1,0 +1,85 @@
+name: Backup database e test di restore
+
+# Backup giornaliero cifrato dello schema public + test di restore su PostgreSQL effimero.
+# Richiede i secret SUPABASE_DB_URL (connessione diretta/pooler session) e BACKUP_PASSPHRASE.
+# Senza secret il job termina senza errori (nessun backup possibile).
+# Il piano Supabase Free non include backup giornalieri gestiti: questo workflow ne fa le veci.
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      restore:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verifica configurazione
+        id: cfg
+        env:
+          DB: ${{ secrets.SUPABASE_DB_URL }}
+          PASS: ${{ secrets.BACKUP_PASSPHRASE }}
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          # Personal OS contiene dati personali: su un repository PUBBLICO log e artefatti sono leggibili da chiunque,
+          # quindi il backup qui e' disattivato (usare un repository privato o i backup del piano Supabase).
+          if [ "$PRIVATE" != "true" ]; then echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "Repository pubblico: backup disattivato per privacy."; exit 0; fi
+          if [ -z "$DB" ] || [ -z "$PASS" ]; then echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "Backup non configurato."; else echo "enabled=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Dump (solo schema public, dati applicativi)
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          # il container gira con l'utente del runner: il dump resta cancellabile (shred) dopo la cifratura
+          docker run --rm --network host --user "$(id -u):$(id -g)" -e SUPABASE_DB_URL -v "$PWD:/out" postgres:17 \
+            sh -c 'pg_dump "$SUPABASE_DB_URL" --schema=public --no-owner --no-privileges --format=custom --file=/out/backup.dump'
+          ls -la backup.dump
+          # conteggi di riferimento (solo numeri, nessun dato) per verificare il restore
+          docker run --rm --network host -e SUPABASE_DB_URL -v "$PWD/supabase/tests:/sql:ro" postgres:17 \
+            psql "$SUPABASE_DB_URL" -qAt -v ON_ERROR_STOP=1 -f /sql/row-counts.sql > counts-source.txt
+      - name: Test di restore su PostgreSQL effimero
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          PGPASSWORD: postgres
+        run: |
+          # 1) schema ricreato dalle migrazioni versionate del repository
+          psql -h localhost -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -f supabase/tests/supabase-stub.sql
+          for f in $(ls supabase/migrations/*.sql | sort); do
+            psql -h localhost -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          # 2) solo dati, trigger disattivati (audit/versioning non devono rigenerare righe); fallisce a qualsiasi errore
+          docker run --rm --network host -e PGPASSWORD -v "$PWD:/in" postgres:17 \
+            pg_restore -h localhost -p 5433 -U postgres -d postgres --data-only --disable-triggers --no-owner --exit-on-error /in/backup.dump
+          # 3) stessi conteggi della sorgente
+          psql -h localhost -p 5433 -U postgres -qAt -v ON_ERROR_STOP=1 -f supabase/tests/row-counts.sql > counts-restore.txt
+          if ! diff -q counts-source.txt counts-restore.txt >/dev/null; then echo "Conteggi diversi tra sorgente e restore"; exit 1; fi
+          echo "Conteggi identici su $(wc -l < counts-restore.txt) tabelle"
+          # 4) smoke test: RLS, privilegi anon, isolamento tenant sul database ripristinato
+          psql -h localhost -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -f supabase/tests/smoke.sql
+      - name: Cifra e conserva (7 giorni)
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" --symmetric --cipher-algo AES256 -o backup.dump.gpg backup.dump
+          shred -u backup.dump
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: db-backup-${{ github.run_id }}
+          path: backup.dump.gpg
+          retention-days: 7

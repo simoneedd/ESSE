@@ -1,0 +1,49 @@
+name: Rollback applicazione (manuale, con approvazione)
+
+# Riporta la produzione a un deployment Vercel precedente (instant rollback).
+# Avvio solo manuale; l'environment "production" deve avere reviewer obbligatori
+# (Settings > Environments) cosi' ogni rollback richiede approvazione esplicita.
+# Il database NON viene modificato: per i rollback di schema vedi docs/ROLLBACK.md.
+on:
+  workflow_dispatch:
+    inputs:
+      deployment:
+        description: "URL o ID del deployment Vercel a cui tornare (vuoto = precedente)"
+        required: false
+        type: string
+      reason:
+        description: "Motivo del rollback"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Vercel rollback
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          TARGET: ${{ inputs.deployment }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then echo "VERCEL_TOKEN non configurato"; exit 1; fi
+          echo "Rollback richiesto da $GITHUB_ACTOR. Motivo: $REASON"
+          if [ -n "$TARGET" ]; then npx --yes vercel@66.6.0 rollback "$TARGET" --token "$VERCEL_TOKEN" --yes
+          else npx --yes vercel@66.6.0 rollback --token "$VERCEL_TOKEN" --yes; fi
+      - name: Verifica salute dopo il rollback
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          [ -z "$APP_URL" ] && exit 0
+          sleep 15
+          curl -sSf --max-time 20 "$APP_URL/api/health"

@@ -334,9 +334,19 @@ export function planDay(input: PlanInput): PlanResult {
       continue;
     }
     // finestre ammesse: lavoro dentro l'orario lavorativo, il resto in tutta la giornata
-    const windows = free
+    let windows = free
       .map((f) => ({ s: Math.max(f.s, earliest, work ? wStart : dayStart), e: Math.min(f.e, work ? wEnd : dayEnd) }))
       .filter((f) => f.e - f.s >= Math.min(need, MIN_CHUNK));
+    // preferenze: un unico slot che contenga tutta l'attivita' (se non serve spezzarla) e, per le aree
+    // non lavorative, slot fuori dall'orario di lavoro, cosi' il tempo lavorativo resta al lavoro
+    const outsideWork = (w: Interval) => !work && (w.e <= wStart || w.s >= wEnd);
+    if (need <= focus) {
+      const whole = windows.filter((w) => w.e - w.s >= need);
+      const pick = whole.find(outsideWork) ?? whole[0];
+      if (pick) windows = [pick, ...windows.filter((w) => w !== pick)];
+    } else if (!work) {
+      windows = [...windows.filter(outsideWork), ...windows.filter((w) => !outsideWork(w))];
+    }
     let remaining = need;
     const parts: (Interval & { brk?: boolean })[] = [];
     let cont = continuous;

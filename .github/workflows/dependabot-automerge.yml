@@ -1,0 +1,36 @@
+name: Auto-merge controllato (policy esplicita)
+
+# Abilita l'auto-merge SOLO se:
+#  - la PR e' di Dependabot;
+#  - la variabile di repository AUTO_MERGE_POLICY vale "patch" (default: assente = disattivato);
+#  - l'aggiornamento e' di tipo patch (x.y.Z) secondo il titolo della PR.
+# GitHub completa il merge solo dopo che TUTTI i controlli obbligatori della branch protection
+# (CI + Security) sono verdi. Nessun bypass, nessun --admin, nessun merge di major/minor.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]' && vars.AUTO_MERGE_POLICY == 'patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Verifica tipo di aggiornamento e abilita auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "Titolo: $TITLE"
+          if echo "$TITLE" | grep -Eq 'from ([0-9]+)\.([0-9]+)\.[0-9]+ to \1\.\2\.[0-9]+'; then
+            gh pr merge --auto --squash "$PR_URL"
+            echo "Auto-merge abilitato (attende i controlli obbligatori)."
+          else
+            echo "Non e' un aggiornamento patch singolo: richiesta revisione umana."
+          fi
